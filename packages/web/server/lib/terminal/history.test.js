@@ -44,6 +44,79 @@ describe('terminal replay history', () => {
     expect(c1String).toEqual({ visible: 'safe', pending: '' });
   });
 
+  it('bounds 7-bit and C1 CSI carry and discards through the final byte', () => {
+    let csi = sanitizeTerminalHistoryChunk('', '\u001b[' + '1'.repeat(4094));
+    expect(csi.pending).toHaveLength(4096);
+    expect(sanitizeTerminalHistoryChunk(csi.pending, 'mvisible')).toEqual({ visible: 'visible', pending: '' });
+
+    csi = sanitizeTerminalHistoryChunk('', '\u001b[' + '1'.repeat(4096));
+    expect(csi.pending).toEqual({ type: 'discard-control-sequence', kind: 'csi' });
+    csi = sanitizeTerminalHistoryChunk(csi.pending, '1'.repeat(8192));
+    expect(csi.pending).toEqual({ type: 'discard-control-sequence', kind: 'csi' });
+    expect(sanitizeTerminalHistoryChunk(csi.pending, 'mvisible')).toEqual({ visible: 'visible', pending: '' });
+
+    const c1Csi = sanitizeTerminalHistoryChunk('', '\u009b' + '1'.repeat(4096));
+    expect(c1Csi.pending).toEqual({ type: 'discard-control-sequence', kind: 'csi' });
+    expect(sanitizeTerminalHistoryChunk(c1Csi.pending, 'nvisible')).toEqual({ visible: 'visible', pending: '' });
+  });
+
+  it('keeps a 4,096-unit CSI and discards oversized completed CSI in one chunk', () => {
+    const exact = '\u001b[' + '1'.repeat(4093) + 'm';
+    expect(exact).toHaveLength(4096);
+    expect(sanitizeTerminalHistoryChunk('', exact)).toEqual({ visible: exact, pending: '' });
+
+    const c1Exact = '\u009b' + '1'.repeat(4094) + 'm';
+    expect(c1Exact).toHaveLength(4096);
+    expect(sanitizeTerminalHistoryChunk('', c1Exact)).toEqual({ visible: c1Exact, pending: '' });
+    expect(sanitizeTerminalHistoryChunk('', '\u001b[' + '1'.repeat(4094) + 'mvisible')).toEqual({ visible: 'visible', pending: '' });
+    expect(sanitizeTerminalHistoryChunk('', '\u009b' + '1'.repeat(4095) + 'mvisible')).toEqual({ visible: 'visible', pending: '' });
+  });
+
+  it('bounds ESC intermediate carry, consumes its final byte, and preserves split selectors', () => {
+    const exact = '\u001b' + ' '.repeat(4094) + '0';
+    expect(exact).toHaveLength(4096);
+    expect(sanitizeTerminalHistoryChunk('', exact)).toEqual({ visible: exact, pending: '' });
+
+    let escape = sanitizeTerminalHistoryChunk('', '\u001b' + ' '.repeat(4095));
+    expect(escape.pending).toHaveLength(4096);
+    escape = sanitizeTerminalHistoryChunk(escape.pending, ' ');
+    expect(escape.pending).toEqual({ type: 'discard-control-sequence', kind: 'escape' });
+    escape = sanitizeTerminalHistoryChunk(escape.pending, ' '.repeat(8192));
+    expect(escape.pending).toEqual({ type: 'discard-control-sequence', kind: 'escape' });
+    expect(sanitizeTerminalHistoryChunk(escape.pending, '0visible')).toEqual({ visible: 'visible', pending: '' });
+
+    expect(sanitizeTerminalHistoryChunk('', '\u001b' + ' '.repeat(4095) + '0visible')).toEqual({ visible: 'visible', pending: '' });
+    const loneEscape = sanitizeTerminalHistoryChunk('', '\u001b');
+    expect(loneEscape.pending).toBe('\u001b');
+    expect(sanitizeTerminalHistoryChunk(loneEscape.pending, '[6nvisible')).toEqual({ visible: 'visible', pending: '' });
+
+    const intermediate = sanitizeTerminalHistoryChunk('', '\u001b ');
+    expect(intermediate.pending).toBe('\u001b ');
+    expect(sanitizeTerminalHistoryChunk(intermediate.pending, '[visible')).toEqual({ visible: '\u001b [visible', pending: '' });
+  });
+
+  it('bounds CSI and ESC parser state across multi-megabyte PTY streams', () => {
+    for (const [intro, body, final, kind] of [
+      ['\u001b[', '1', 'm', 'csi'],
+      ['\u001b', ' ', '0', 'escape'],
+    ]) {
+      let result = sanitizeTerminalHistoryChunk('', intro);
+      for (let index = 0; index < 2048; index += 1) {
+        result = sanitizeTerminalHistoryChunk(result.pending, body.repeat(4096));
+      }
+
+      expect(result.visible).toBe('');
+      expect(result.pending).toEqual({ type: 'discard-control-sequence', kind });
+      expect(sanitizeTerminalHistoryChunk(result.pending, `${final}😀visible`)).toEqual({ visible: '😀visible', pending: '' });
+    }
+  });
+
+  it('reprocesses the invalid byte after discarding an oversized ESC intermediate sequence', () => {
+    const escape = sanitizeTerminalHistoryChunk('', '\u001b' + ' '.repeat(4096));
+    expect(escape.pending).toEqual({ type: 'discard-control-sequence', kind: 'escape' });
+    expect(sanitizeTerminalHistoryChunk(escape.pending, '\u0003visible')).toEqual({ visible: '\u0003visible', pending: '' });
+  });
+
   it('copies a short pending OSC suffix from a large PTY chunk', () => {
     const output = 'x'.repeat(8 * 1024 * 1024);
     const sequence = '\u001b]0;title😀\u001b';
@@ -52,6 +125,20 @@ describe('terminal replay history', () => {
     expect(result.visible).toBe(output);
     expect(result.pending.sequence).toBe(sequence);
     expect(result.pending.sequence.length).toBeLessThanOrEqual(4096);
+  });
+
+  it('copies short pending CSI and ESC suffixes from large PTY chunks', () => {
+    const output = 'x'.repeat(8 * 1024 * 1024);
+    const csi = '\u001b[12;';
+    const escape = '\u001b ';
+
+    const pendingCsi = sanitizeTerminalHistoryChunk('', output + csi);
+    expect(pendingCsi.visible).toBe(output);
+    expect(pendingCsi.pending).toBe(csi);
+
+    const pendingEscape = sanitizeTerminalHistoryChunk('', output + escape);
+    expect(pendingEscape.visible).toBe(output);
+    expect(pendingEscape.pending).toBe(escape);
   });
 
   it('recognizes a string terminator split after ESC across an empty chunk', () => {

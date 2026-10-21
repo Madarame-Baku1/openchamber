@@ -6,7 +6,21 @@ const shouldStripCsi = (body, finalByte) =>
   || ((finalByte === 'p' || finalByte === 'y') && /^\?2031(?:;[0-9]+)?\$$/.test(body))
   || ((finalByte === 'h' || finalByte === 'l') && body === '?2031');
 const shouldStripOsc = (content) => /^(10|11|12);(?:\?|rgb:)/.test(content);
-const MAX_CONTROL_STRING_CODE_UNITS = 4096;
+const MAX_CONTROL_SEQUENCE_CODE_UNITS = 4096;
+const isEscapeIntermediateByte = (code) => code >= 0x20 && code <= 0x2f;
+const isEscapeFinalByte = (code) => code >= 0x30 && code <= 0x7e;
+const findCsiEnd = (input, start) => {
+  let cursor = start;
+  while (cursor < input.length && !isCsiFinalByte(input.charCodeAt(cursor))) cursor += 1;
+  return cursor < input.length ? cursor + 1 : null;
+};
+const scanEscapeSequence = (input, start) => {
+  let cursor = start;
+  while (cursor < input.length && isEscapeIntermediateByte(input.charCodeAt(cursor))) cursor += 1;
+  if (cursor >= input.length) return { status: 'incomplete' };
+  if (isEscapeFinalByte(input.charCodeAt(cursor))) return { status: 'complete', end: cursor + 1 };
+  return { status: 'invalid', end: cursor };
+};
 const copyStringRange = (input, start, end) => {
   let copy = '';
   for (let cursor = start; cursor < end; cursor += 1024) {
@@ -29,13 +43,6 @@ const findStringEnd = (input, start) => {
   }
   return null;
 };
-const findEscapeEnd = (input, start) => {
-  let cursor = start;
-  while (cursor < input.length && input.charCodeAt(cursor) >= 0x20 && input.charCodeAt(cursor) <= 0x2f) cursor += 1;
-  if (cursor >= input.length) return null;
-  return input.charCodeAt(cursor) >= 0x30 && input.charCodeAt(cursor) <= 0x7e ? cursor + 1 : start + 1;
-};
-
 // All six control-string introducers: ESC, DCS, CSI, OSC, PM, and APC. Replay
 // history has to notice every one, or a C1 query byte leaks into the replay.
 const isControlIntroducer = (code) => code === 0x1b || code === 0x90 || code === 0x9b || code === 0x9d || code === 0x9e || code === 0x9f;
@@ -48,11 +55,24 @@ const findControlIntroducer = (input, start) => {
 
 export const sanitizeTerminalHistoryChunk = (pending, data) => {
   if (!data) return { visible: '', pending: pending ?? '' };
+  if (pending?.type === 'discard-control-sequence') {
+    let remainder;
+    if (pending.kind === 'csi') {
+      const end = findCsiEnd(data, 0);
+      if (end === null) return { visible: '', pending };
+      remainder = data.slice(end);
+    } else {
+      const sequence = scanEscapeSequence(data, 0);
+      if (sequence.status === 'incomplete') return { visible: '', pending };
+      remainder = data.slice(sequence.end);
+    }
+    return remainder ? sanitizeTerminalHistoryChunk('', remainder) : { visible: '', pending: '' };
+  }
   if (pending?.type === 'control-string') {
     const end = pending.trailingEscape && data.startsWith('\\') ? 1 : findStringEnd(data, 0);
     if (end === null) {
       const combinedLength = pending.sequence.length + data.length;
-      const overflow = pending.overflow || combinedLength > MAX_CONTROL_STRING_CODE_UNITS;
+      const overflow = pending.overflow || combinedLength > MAX_CONTROL_SEQUENCE_CODE_UNITS;
       const sequence = overflow ? '' : copyStringRange(`${pending.sequence}${data}`, 0, combinedLength);
       return {
         visible: '',
@@ -66,7 +86,7 @@ export const sanitizeTerminalHistoryChunk = (pending, data) => {
       };
     }
 
-    const overflow = pending.overflow || pending.sequence.length + end > MAX_CONTROL_STRING_CODE_UNITS;
+    const overflow = pending.overflow || pending.sequence.length + end > MAX_CONTROL_SEQUENCE_CODE_UNITS;
     const sequence = overflow ? '' : `${pending.sequence}${data.slice(0, end)}`;
     const contentStart = sequence.startsWith('\u001b') ? 2 : 1;
     const content = sequence ? stripTerminator(sequence.slice(contentStart)) : '';
@@ -86,21 +106,27 @@ export const sanitizeTerminalHistoryChunk = (pending, data) => {
     const code = input.charCodeAt(index);
     if (code === 0x1b) {
       const next = input.charCodeAt(index + 1);
-      if (Number.isNaN(next)) return { visible, pending: input.slice(index) };
+      if (Number.isNaN(next)) return { visible, pending: copyStringRange(input, index, input.length) };
       if (next === 0x5b) {
-        let cursor = index + 2;
-        while (cursor < input.length && !isCsiFinalByte(input.charCodeAt(cursor))) cursor += 1;
-        if (cursor >= input.length) return { visible, pending: input.slice(index) };
-        const sequence = input.slice(index, cursor + 1);
-        if (!shouldStripCsi(input.slice(index + 2, cursor), input[cursor])) visible += sequence;
-        index = cursor + 1;
+        const end = findCsiEnd(input, index + 2);
+        if (end === null) {
+          if (input.length - index > MAX_CONTROL_SEQUENCE_CODE_UNITS) {
+            return { visible, pending: { type: 'discard-control-sequence', kind: 'csi' } };
+          }
+          return { visible, pending: copyStringRange(input, index, input.length) };
+        }
+        if (end - index <= MAX_CONTROL_SEQUENCE_CODE_UNITS
+          && !shouldStripCsi(input.slice(index + 2, end - 1), input[end - 1])) {
+          visible += input.slice(index, end);
+        }
+        index = end;
         continue;
       }
       if (next === 0x5d || next === 0x50 || next === 0x5e || next === 0x5f) {
         const end = findStringEnd(input, index + 2);
         if (end === null) {
           const sequenceLength = input.length - index;
-          const overflow = sequenceLength > MAX_CONTROL_STRING_CODE_UNITS;
+          const overflow = sequenceLength > MAX_CONTROL_SEQUENCE_CODE_UNITS;
           return {
             visible,
             pending: {
@@ -112,7 +138,7 @@ export const sanitizeTerminalHistoryChunk = (pending, data) => {
             },
           };
         }
-        if (end - index <= MAX_CONTROL_STRING_CODE_UNITS) {
+        if (end - index <= MAX_CONTROL_SEQUENCE_CODE_UNITS) {
           const sequence = input.slice(index, end);
           const content = stripTerminator(input.slice(index + 2, end));
           if (next !== 0x5d || !shouldStripOsc(content)) visible += sequence;
@@ -120,26 +146,48 @@ export const sanitizeTerminalHistoryChunk = (pending, data) => {
         index = end;
         continue;
       }
-      const end = findEscapeEnd(input, index + 1);
-      if (end === null) return { visible, pending: input.slice(index) };
-      visible += input.slice(index, end);
-      index = end;
+      const sequence = scanEscapeSequence(input, index + 1);
+      if (sequence.status === 'incomplete') {
+        if (input.length - index > MAX_CONTROL_SEQUENCE_CODE_UNITS) {
+          return { visible, pending: { type: 'discard-control-sequence', kind: 'escape' } };
+        }
+        return { visible, pending: copyStringRange(input, index, input.length) };
+      }
+      if (sequence.status === 'invalid') {
+        if (sequence.end - index > MAX_CONTROL_SEQUENCE_CODE_UNITS) {
+          index = sequence.end;
+          continue;
+        }
+        // Preserve the existing short malformed-escape handling.
+        const end = Math.min(index + 2, input.length);
+        visible += input.slice(index, end);
+        index = end;
+        continue;
+      }
+      if (sequence.end - index <= MAX_CONTROL_SEQUENCE_CODE_UNITS) visible += input.slice(index, sequence.end);
+      index = sequence.end;
       continue;
     }
     if (code === 0x9b) {
-      let cursor = index + 1;
-      while (cursor < input.length && !isCsiFinalByte(input.charCodeAt(cursor))) cursor += 1;
-      if (cursor >= input.length) return { visible, pending: input.slice(index) };
-      const sequence = input.slice(index, cursor + 1);
-      if (!shouldStripCsi(input.slice(index + 1, cursor), input[cursor])) visible += sequence;
-      index = cursor + 1;
+      const end = findCsiEnd(input, index + 1);
+      if (end === null) {
+        if (input.length - index > MAX_CONTROL_SEQUENCE_CODE_UNITS) {
+          return { visible, pending: { type: 'discard-control-sequence', kind: 'csi' } };
+        }
+        return { visible, pending: copyStringRange(input, index, input.length) };
+      }
+      if (end - index <= MAX_CONTROL_SEQUENCE_CODE_UNITS
+        && !shouldStripCsi(input.slice(index + 1, end - 1), input[end - 1])) {
+        visible += input.slice(index, end);
+      }
+      index = end;
       continue;
     }
     if (code === 0x9d || code === 0x90 || code === 0x9e || code === 0x9f) {
       const end = findStringEnd(input, index + 1);
       if (end === null) {
         const sequenceLength = input.length - index;
-        const overflow = sequenceLength > MAX_CONTROL_STRING_CODE_UNITS;
+        const overflow = sequenceLength > MAX_CONTROL_SEQUENCE_CODE_UNITS;
         return {
           visible,
           pending: {
@@ -151,7 +199,7 @@ export const sanitizeTerminalHistoryChunk = (pending, data) => {
           },
         };
       }
-      if (end - index <= MAX_CONTROL_STRING_CODE_UNITS) {
+      if (end - index <= MAX_CONTROL_SEQUENCE_CODE_UNITS) {
         const sequence = input.slice(index, end);
         const content = stripTerminator(input.slice(index + 1, end));
         if (code !== 0x9d || !shouldStripOsc(content)) visible += sequence;
