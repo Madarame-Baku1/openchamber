@@ -377,6 +377,7 @@ export function createTerminalRuntime({
           else if (!session.outputTimer) { flushOutput(session); openOutputWindow(session); }
         } else {
           flushOutput(session);
+          session.pendingHistoryControlSequence = '';
           session.status = 'exited';
           session.exitCode = Number.isInteger(event.exitCode) ? event.exitCode : null;
           session.signal = Number.isInteger(event.signal) ? event.signal : null;

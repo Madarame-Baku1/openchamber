@@ -962,8 +962,28 @@ describe('terminal runtime', () => {
       const bounded = await second.next('snapshot');
       expect(bounded.history).toBe(expectedHistory);
       expect(Buffer.byteLength(bounded.history)).toBeLessThanOrEqual(512 * 1024);
+      const finalText = '\nfinal output';
+      const incompleteQuery = '\u001b]11;?';
+      await new Promise(resolve => setTimeout(resolve, 25));
+      processes[0].emitData('before exit');
+      processes[0].emitData(finalText + incompleteQuery);
       processes[0].emitExit(7);
-      expect(await second.next('exit')).toMatchObject({ s: 'term-live', q: bounded.q + 1, exitCode: 7 });
+      let finalOutput;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const index = second.messages.findIndex(message => message?.t === 'output' && message.s === 'term-live' && message.d.includes(finalText));
+        if (index >= 0) {
+          finalOutput = second.messages.splice(index, 1)[0];
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2));
+      }
+      expect(finalOutput).toMatchObject({ s: 'term-live', d: expect.stringContaining(finalText + incompleteQuery) });
+      expect(await second.next('exit')).toMatchObject({ s: 'term-live', q: bounded.q + 3, exitCode: 7 });
+      second.socket.send(createTerminalWsControlFrame({ t: 'attach', v: 3, s: 'term-live' }));
+      const exitedSnapshot = await second.next('snapshot');
+      expect(exitedSnapshot).toMatchObject({ s: 'term-live', status: 'exited' });
+      expect(exitedSnapshot.history.endsWith(finalText)).toBe(true);
+      expect(exitedSnapshot.history.includes(incompleteQuery)).toBe(false);
 
       const closed = await fetch(`${base}/api/terminal/term-live`, { method: 'DELETE' });
       expect(closed.status).toBe(200);

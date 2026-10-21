@@ -6,6 +6,17 @@ const shouldStripCsi = (body, finalByte) =>
   || ((finalByte === 'p' || finalByte === 'y') && /^\?2031(?:;[0-9]+)?\$$/.test(body))
   || ((finalByte === 'h' || finalByte === 'l') && body === '?2031');
 const shouldStripOsc = (content) => /^(10|11|12);(?:\?|rgb:)/.test(content);
+const MAX_CONTROL_STRING_CODE_UNITS = 4096;
+const copyStringRange = (input, start, end) => {
+  let copy = '';
+  for (let cursor = start; cursor < end; cursor += 1024) {
+    const length = Math.min(1024, end - cursor);
+    const codeUnits = new Array(length);
+    for (let index = 0; index < length; index += 1) codeUnits[index] = input.charCodeAt(cursor + index);
+    copy += String.fromCharCode(...codeUnits);
+  }
+  return copy;
+};
 const stripTerminator = (value) => {
   if (value.endsWith('\u001b\\')) return value.slice(0, -2);
   return value.endsWith('\u0007') || value.endsWith('\u009c') ? value.slice(0, -1) : value;
@@ -36,7 +47,36 @@ const findControlIntroducer = (input, start) => {
 };
 
 export const sanitizeTerminalHistoryChunk = (pending, data) => {
-  const input = `${pending}${data}`;
+  if (!data) return { visible: '', pending: pending ?? '' };
+  if (pending?.type === 'control-string') {
+    const end = pending.trailingEscape && data.startsWith('\\') ? 1 : findStringEnd(data, 0);
+    if (end === null) {
+      const combinedLength = pending.sequence.length + data.length;
+      const overflow = pending.overflow || combinedLength > MAX_CONTROL_STRING_CODE_UNITS;
+      const sequence = overflow ? '' : copyStringRange(`${pending.sequence}${data}`, 0, combinedLength);
+      return {
+        visible: '',
+        pending: {
+          type: 'control-string',
+          sequence: overflow ? '' : sequence,
+          overflow,
+          osc: pending.osc,
+          trailingEscape: data.endsWith('\u001b'),
+        },
+      };
+    }
+
+    const overflow = pending.overflow || pending.sequence.length + end > MAX_CONTROL_STRING_CODE_UNITS;
+    const sequence = overflow ? '' : `${pending.sequence}${data.slice(0, end)}`;
+    const contentStart = sequence.startsWith('\u001b') ? 2 : 1;
+    const content = sequence ? stripTerminator(sequence.slice(contentStart)) : '';
+    const completed = !overflow && (!pending.osc || !shouldStripOsc(content)) ? sequence : '';
+    const remainder = data.slice(end);
+    const rest = remainder ? sanitizeTerminalHistoryChunk('', remainder) : { visible: '', pending: '' };
+    return { visible: completed + rest.visible, pending: rest.pending };
+  }
+
+  const input = `${pending ?? ''}${data}`;
   // With no carried state and no introducer anywhere, the chunk is ordinary
   // text and replay-safe as it stands; hand it back instead of rebuilding it.
   if (!pending && findControlIntroducer(input, 0) === -1) return { visible: input, pending: '' };
@@ -58,10 +98,25 @@ export const sanitizeTerminalHistoryChunk = (pending, data) => {
       }
       if (next === 0x5d || next === 0x50 || next === 0x5e || next === 0x5f) {
         const end = findStringEnd(input, index + 2);
-        if (end === null) return { visible, pending: input.slice(index) };
-        const sequence = input.slice(index, end);
-        const content = stripTerminator(input.slice(index + 2, end));
-        if (next !== 0x5d || !shouldStripOsc(content)) visible += sequence;
+        if (end === null) {
+          const sequenceLength = input.length - index;
+          const overflow = sequenceLength > MAX_CONTROL_STRING_CODE_UNITS;
+          return {
+            visible,
+            pending: {
+              type: 'control-string',
+              sequence: overflow ? '' : copyStringRange(input, index, input.length),
+              overflow,
+              osc: next === 0x5d,
+              trailingEscape: input.endsWith('\u001b'),
+            },
+          };
+        }
+        if (end - index <= MAX_CONTROL_STRING_CODE_UNITS) {
+          const sequence = input.slice(index, end);
+          const content = stripTerminator(input.slice(index + 2, end));
+          if (next !== 0x5d || !shouldStripOsc(content)) visible += sequence;
+        }
         index = end;
         continue;
       }
@@ -82,10 +137,25 @@ export const sanitizeTerminalHistoryChunk = (pending, data) => {
     }
     if (code === 0x9d || code === 0x90 || code === 0x9e || code === 0x9f) {
       const end = findStringEnd(input, index + 1);
-      if (end === null) return { visible, pending: input.slice(index) };
-      const sequence = input.slice(index, end);
-      const content = stripTerminator(input.slice(index + 1, end));
-      if (code !== 0x9d || !shouldStripOsc(content)) visible += sequence;
+      if (end === null) {
+        const sequenceLength = input.length - index;
+        const overflow = sequenceLength > MAX_CONTROL_STRING_CODE_UNITS;
+        return {
+          visible,
+          pending: {
+            type: 'control-string',
+            sequence: overflow ? '' : copyStringRange(input, index, input.length),
+            overflow,
+            osc: code === 0x9d,
+            trailingEscape: input.endsWith('\u001b'),
+          },
+        };
+      }
+      if (end - index <= MAX_CONTROL_STRING_CODE_UNITS) {
+        const sequence = input.slice(index, end);
+        const content = stripTerminator(input.slice(index + 1, end));
+        if (code !== 0x9d || !shouldStripOsc(content)) visible += sequence;
+      }
       index = end;
       continue;
     }
